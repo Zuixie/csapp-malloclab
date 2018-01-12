@@ -1,5 +1,5 @@
 /*
- * mm.c
+ * mm-implicit.c
  * Simple allocator implement by implicit free list.
  * each block struct like this
  *  31      ...           3| 2  1  0
@@ -47,7 +47,6 @@
 
 /* rounds up to the nearest multiple of ALIGNMENT */
 #define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
-
 
 #define PACK(size, alloc) ((size) | (alloc))
 #define GET(p) (*(unsigned int*)(p))
@@ -406,7 +405,6 @@ static void *coalesce(void *ptr)
     void *pre = PRE_BLPR(ptr);  
     void *next = NEXT_BLPR(ptr);
     size_t size;
-    // dbg_printf("coalesce cur:%p, pre: %d, next:%d; \n", ptr, GET_ALLOC(HDPR(pre)), GET_ALLOC(HDPR(next)));
     // case 1 pre:alloc, next:alloc
     if (GET_ALLOC(HDPR(pre)) && GET_ALLOC(HDPR(next))) 
     {
@@ -425,10 +423,8 @@ static void *coalesce(void *ptr)
     else if ((!GET_ALLOC(HDPR(pre))) && GET_ALLOC(HDPR(next))) 
     {
         size = GET_SIZE(HDPR(ptr)) + GET_SIZE(HDPR(pre));
-        // dbg_printf("in case 3 size: %x, %x, %x ... ...\n", GET_SIZE(HDPR(ptr)), GET_SIZE(HDPR(pre)), (int)size);
         PUT(HDPR(pre), PACK(size, 0));
         PUT(FTPR(pre), PACK(size, 0));
-        // dbg_printf("h:%p %x f:%p %x\n", HDPR(pre), GET_SIZE(HDPR(pre)), FTPR(pre), GET_SIZE(FTPR(pre)));
         
         return pre;
     }
