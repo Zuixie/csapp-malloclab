@@ -1,5 +1,5 @@
 /*
- * mm.c
+ * mm-explicit.c
  * Allocator implement by explicit free list.
  * each allocated block struct like this
  *  31      ...           3| 2  1  0
