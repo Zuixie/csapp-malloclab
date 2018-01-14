@@ -1,7 +1,7 @@
 /*
- * mm.c
+ * mm-segregated-p8.c
  * Allocator implement by segregated free list.
- * each allocated block struct like this
+ * Each allocated block struct like this
  *  31      ...           3| 2  1  0
  *  --------------------------------
  * | 00 ... size (29 bits) | 0 0 a/f| header 
@@ -13,25 +13,23 @@
  * whether the block is allocated or free.
  *
  *
- * each free block struct like this
+ * Each free block struct like this
  *  31      ...           3| 2  1  0
  *  --------------------------------
  * | 00 ... size (29 bits) | 0 0 a/f| header 
- * |      succ (successor)          | succ_addr = heap_start_addr + succ
- * |      pred (predecessor)        | pred_addr = heap_start_addr + pred
+ * |   succ (successor addr low)    | 
+ * |   succ (successor addr high)   | 
+ * |   pred (predecessor addr low)  | 
+ * |   pred (predecessor addr high) | 
  * | 00 ... size (29 bits) | 0 0 a/f| footer
  *  --------------------------------
  * All free blocks organized by doubly linked list.
- * This reduces the first-fit allocation time.  
- *
- * Maintain the list in last-in first-out (LIFO),
- * inserting newly freed blocks at the beginning of the list. 
  * 
- * The first 4 bytes of the heap are the 
- * prologue block of the linked list.
- * This block store the successor value.
- * The reason for this desgin is to optimize
- * the addition and remove of block. 
+ * The allocator maintains an array of free lists,
+ * with one free list per size class, ordered by increasing size.
+ * If given a allocate size n then the class size i is satisfied
+ * (2^(i+3)) <= n < (2^(i+4)). 
+ * If i >= SEG_MAX then i = SEG_MAX - 1.
  */
 #include <assert.h>
 #include <stdio.h>
@@ -66,14 +64,15 @@
 #define WSIZE 4
 #define DSIZE 8
 
-#define SEG_MAX 10
-#define MIN_BLOCK_SIZE 16
 #define CHUNKSIZE  (1<<8)
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+#define SEG_MAX 10
+#define MIN_BLOCK_SIZE 24
+#define POINT_SIZE 8
 
 /* rounds up to the nearest multiple of ALIGNMENT */
 #define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
-
+#define MAX(a, b) ((a) > (b) ? (a) : (b)) 
 #define PACK(size, alloc) ((size) | (alloc))
 #define GET(p) (*(unsigned int*)(p))
 #define PUT(p, val) (*(unsigned int *)(p) = (val))
@@ -86,12 +85,14 @@
 #define NEXT_BLPR(p) (FTPR(p) + DSIZE)
 #define PRE_BLPR(p) (((char *)(p)) - GET_SIZE(HDPR(p) - WSIZE))
 
-#define GET_PRED_PTR(p) ((char *)(p) + WSIZE)
-#define GET_SUCC_PTR(p) ((char *)(p))
-#define GET_PRED_VAL(p) GET(GET_PRED_PTR(p))
-#define GET_SUCC_VAL(p) GET(GET_SUCC_PTR(p))
-#define SET_PRED_VAL(p, val) PUT(GET_PRED_PTR(p), val)
-#define SET_SUCC_VAL(p, val) PUT(GET_SUCC_PTR(p), val)
+
+#define GET_LONG(p) (*(unsigned long *)(p))
+#define GET_POINT(p) ((char *)GET_LONG(p))
+#define SET_POINT(p, val) (*(unsigned long *)(p) = ((unsigned long)(val)))
+#define GET_PRED_POINT(p) GET_POINT(p + DSIZE)
+#define GET_SUCC_POINT(p) GET_POINT(p)
+#define SET_PRED_VAL(p, val) SET_POINT(p + DSIZE, val)
+#define SET_SUCC_VAL(p, val) SET_POINT(p, val)
 
 /* Global variables */
 static char *heap_listp;
@@ -116,27 +117,29 @@ static unsigned int check_whole_heap(int verbose);
  * mm_init - Called when a new trace starts.
  * heap_start_addr              heap_listp
  * |                                 |
- * |   seg array  (SEG_MAX * 4)   | 4 | 4 | 4 | 4 |
+ * |   seg array  (30 * 4)   | 4 | 4 | 4 | 4 |
  * | 
  * free_listp
  */
 int mm_init(void)
 {
-    // allocate init block -> | arrary size: 8 * SEG_MAX | 16bytes |  
-    if ((heap_listp = mem_sbrk(4 * WSIZE + SEG_MAX * DSIZE))
+    // allocate init block -> | arrary size: 16 * SEG_MAX | 16bytes |  
+    if ((heap_listp = mem_sbrk(4 * WSIZE + SEG_MAX * DSIZE * 2))
         == (void *)-1) 
         return -1;
     
+    char *temp;
     heap_start_addr = heap_listp;
     free_listp = heap_listp;
 
     for (unsigned int i = 0; i < SEG_MAX; i++) 
     {
-        PUT(heap_listp + i * DSIZE, i * DSIZE);
-        PUT(heap_listp + WSIZE + i * DSIZE, i * DSIZE);
+        temp = heap_listp + DSIZE * 2 * i;
+        SET_PRED_VAL(temp, temp);
+        SET_SUCC_VAL(temp, temp);
     }
 
-    heap_listp += (SEG_MAX * DSIZE);
+    heap_listp += (SEG_MAX * DSIZE * 2);
     PUT(heap_listp, 0);
     PUT(heap_listp + WSIZE, PACK(8, 1));
     PUT(heap_listp + 2 * WSIZE, PACK(8, 1));
@@ -156,30 +159,21 @@ int mm_init(void)
  */
 void *malloc(size_t size)
 {
-    size_t newsize;
-    size_t sbrk_size;
+    size_t newsize, sbrk_size;
     char *ptr;
 
     if (size <= 0) 
         return NULL;
     newsize = ALIGN(size + DSIZE);
+    newsize = MIN_BLOCK_SIZE > newsize ? MIN_BLOCK_SIZE : newsize;
 
     ptr = find_first_fit(newsize);
     // ptr = find_best_fit(newsize);   
     // ptr = find_next_fit(newsize);
     
-    if (ptr == NULL) 
+    if (!ptr) 
     {
         // call mem_sbrk
-        // if ((ptr = mem_sbrk(newsize)) == (void *)-1) 
-        //     return NULL;
-        // PUT(ptr + newsize - WSIZE, 1);
-        // PUT(HDPR(ptr), PACK(newsize, 1));
-        // PUT(FTPR(ptr), PACK(newsize, 1));
-
-        // dbg_printf("malloc: %x, %p\n", (unsigned int)newsize, ptr);
-        // return ptr;
-
         sbrk_size = ALIGN(MAX(newsize, CHUNKSIZE));
         if ((ptr = mem_sbrk(sbrk_size)) == (void *)-1) 
             return NULL;
@@ -187,15 +181,16 @@ void *malloc(size_t size)
         PUT(HDPR(ptr), PACK(sbrk_size, 0));
         PUT(FTPR(ptr), PACK(sbrk_size, 0));
         freelist_add(ptr);
-
         place(ptr, newsize);
-        dbg_printf("malloc: %x, %p\n", (unsigned int)newsize, ptr);
 
-        return ptr;
+        dbg_printf("malloc: %x, %x, %x, %p\n", (unsigned int)size, (unsigned int)newsize, (unsigned int)sbrk_size, ptr);
+    } 
+    else 
+    {
+        place(ptr, newsize);
+        dbg_printf("malloc: %x, %x, %p\n", (unsigned int)size, (unsigned int)newsize, ptr);
     }
 
-    place(ptr, newsize);
-    dbg_printf("malloc: %x, %p\n", (unsigned int)newsize, ptr);
     return ptr;
 }
 
@@ -246,6 +241,7 @@ void *realloc(void *oldptr, size_t size)
 
     oldsize = GET_SIZE(HDPR(oldptr));
     newsize = ALIGN(size + DSIZE);
+    newsize = MIN_BLOCK_SIZE > newsize ? MIN_BLOCK_SIZE : newsize;
 
     // oldsize == newsize, return oldptr
     if (oldsize == newsize) 
@@ -255,9 +251,9 @@ void *realloc(void *oldptr, size_t size)
     // newsize < oldsize, do not need to alloc new block 
     else if (newsize < oldsize)
     {
-        if (oldsize - newsize < 16) 
+        if (oldsize - newsize < MIN_BLOCK_SIZE) 
             return oldptr;
-        // oldsize - newsize > 16 -> need to split and coalesce
+        // oldsize - newsize > min block -> need to split and coalesce
         PUT(HDPR(oldptr), PACK(newsize, 1));
         PUT(FTPR(oldptr), PACK(newsize, 1));
         
@@ -348,57 +344,50 @@ void mm_checkheap(int verbose)
 
 }
 
+/* Given a size return the size class. */
 static inline unsigned int get_seg_index(size_t size)
 {
     unsigned int index = 0;
-    size = size >> 3;
+    size = size >> 4; // because the min block size is 24 (11000)
     while (size >> index) index++; 
     return index > SEG_MAX ? SEG_MAX - 1 : index - 1;
-}
-
-static inline void *next_free_blk(void *ptr) 
-{
-    unsigned int val = GET_SUCC_VAL(ptr);
-    return heap_start_addr + val;
-}
-
-static inline void *pred_free_blk(void *ptr)
-{
-    unsigned int val = GET_PRED_VAL(ptr);
-    return heap_start_addr + val;
 }
 
 /* remove request block from free list */
 static inline void freelist_remove(void *ptr)
 {
-    // unsigned int index = get_seg_index(GET_SIZE(HDPR(ptr)));
-    unsigned int pred_val = GET_PRED_VAL(ptr);
-    unsigned int succ_val = GET_SUCC_VAL(ptr);
-
-    char *pred = heap_start_addr + pred_val;
-    char *succ = heap_start_addr + succ_val;
+    char *pred = GET_PRED_POINT(ptr);
+    char *succ = GET_SUCC_POINT(ptr);
     
-    SET_SUCC_VAL(pred, succ_val);
-    SET_PRED_VAL(succ, pred_val);  
+    SET_SUCC_VAL(pred, succ);
+    SET_PRED_VAL(succ, pred);  
 }
 
 static inline void freelist_add(void *ptr)
 {   
     unsigned int index = get_seg_index(GET_SIZE(HDPR(ptr)));
-    char *start = free_listp + DSIZE * index;
-    unsigned int succ_val = GET_SUCC_VAL(start);
-    unsigned int cur_val = ((char *)ptr) - heap_start_addr;
+    char *start = free_listp + DSIZE * 2 * index;
+
+    char *succ_p = GET_SUCC_POINT(start);
 
     // set block self
-    SET_PRED_VAL(ptr, index * DSIZE);
-    SET_SUCC_VAL(ptr, succ_val);
+    SET_PRED_VAL(ptr, start);
+    SET_SUCC_VAL(ptr, succ_p);
     
     // set succ block pred point
-    SET_PRED_VAL(heap_start_addr + succ_val, cur_val);
+    SET_PRED_VAL(succ_p, ptr);
     // set pred block succ point
-    SET_SUCC_VAL(start, cur_val);
+    SET_SUCC_VAL(start, ptr);
 }
 
+/* 
+ * Segregated fits.
+ * We determine the size of class of the request and do 
+ * a first-fit search of the appropriate free list for
+ * a block that fits. If we cannot find a block that fits,
+ * then we search the free list for the next larger size class.  
+ * If none of the free lists yields a block that fits, then returns null.
+ */
 static void *find_first_fit(size_t size)
 {
     unsigned int index = 0;
@@ -410,72 +399,19 @@ static void *find_first_fit(size_t size)
     
     for (; index < SEG_MAX; index++) 
     {
-        free_list_start = index * DSIZE + free_listp;
-        ptr = heap_start_addr + GET_SUCC_VAL(free_list_start);
+        free_list_start = index * DSIZE * 2 + free_listp;
+        ptr = GET_SUCC_POINT(free_list_start);
         while (ptr != free_list_start)
         {        
             if (size <= GET_SIZE(HDPR(ptr))) 
             {
                 return ptr;
             }
-            ptr = heap_start_addr + GET_SUCC_VAL(ptr);
+            ptr = GET_SUCC_POINT(ptr);
         }
     }
 
     return NULL;
-}
-
-static void *find_next_fit(size_t size)
-{
-    char *ptr = next_find_ptr;
-    char *temp;
-
-    do 
-    {
-        temp = HDPR(ptr);
-        if (GET_ALLOC(temp) == 0 && size <= GET_SIZE(temp)) 
-        {
-            next_find_ptr = ptr;
-            return ptr;
-        }
-
-        ptr = NEXT_BLPR(ptr);
-
-        if (GET(HDPR(ptr)) == 0x01) 
-            ptr = heap_listp;
-
-    } while (ptr != next_find_ptr);
-
-    return NULL;
-}
-
-static void *find_best_fit(size_t size)
-{
-    char *ptr = heap_start_addr + GET_SUCC_VAL(free_listp);
-    char *best_ptr = NULL;
-    size_t size_gap = 0;
-    char *temp;
-
-    while (ptr != heap_start_addr)
-    {
-        temp = HDPR(ptr);
-        // find free && have enough space
-        if (size <= GET_SIZE(temp)) 
-        {
-            // first or the size of gap smaller than the last one
-            if (GET_SIZE(temp) - size < size_gap || best_ptr == NULL) 
-            {
-                size_gap = GET_SIZE(temp) - size;
-                best_ptr = ptr;
-                if (size_gap == 0)
-                    return best_ptr;
-            }
-        }
-
-        ptr = heap_start_addr + GET_SUCC_VAL(ptr);
-    }
-
-    return best_ptr;
 }
 
 /*
@@ -575,8 +511,8 @@ static unsigned int check_seg_list(int verbose)
     for (index = 0; index < SEG_MAX; index++) 
     {
         count_temp = 0;
-        free_list_start = index * DSIZE + free_listp;
-        ptr = heap_start_addr + GET_SUCC_VAL(free_list_start);
+        free_list_start = index * DSIZE * 2 + free_listp;
+        ptr = GET_SUCC_POINT(free_list_start);
         if (verbose > 2) 
         {
             dbg_printf("%p:%p-", free_list_start, ptr);
@@ -585,13 +521,15 @@ static unsigned int check_seg_list(int verbose)
         {        
             count++;
             count_temp++;
-            ptr = heap_start_addr + GET_SUCC_VAL(ptr);
+            ptr = GET_SUCC_POINT(ptr);
         }
         if (verbose > 2)
         {
             dbg_printf("%u:%u\n", index, count_temp);
         }
+        printf("%03d ", count_temp);
     }
+    printf("\n");
 
     return count;
 }
@@ -602,12 +540,14 @@ static unsigned int check_whole_heap(int verbose)
         return 0;
     unsigned int size_temp;
     char *temp;
+    unsigned int heap_block_count = 0;
     unsigned int freecount_heap = 0;
     char *ptr = heap_listp;
     int last_free = 0;
 
     while (GET(HDPR(ptr)) != 0x01)
     {
+        heap_block_count++;
         temp = HDPR(ptr);
         size_temp = GET_SIZE(temp);
 
@@ -621,7 +561,7 @@ static unsigned int check_whole_heap(int verbose)
         {
             dbg_printf("%p | %08x | %u | %p | %p | %p \n", temp, 
                    size_temp, GET_ALLOC(temp), ptr,
-                   pred_free_blk(ptr), next_free_blk(ptr));
+                   GET_PRED_POINT(ptr), GET_SUCC_POINT(ptr));
             freecount_heap++;
             if (last_free) 
             {
@@ -635,6 +575,13 @@ static unsigned int check_whole_heap(int verbose)
         {
             printf("error!! head != foot %p\n", ptr);
             exit(1);
+        }
+
+        // check minimun size
+        if(size_temp < MIN_BLOCK_SIZE && heap_block_count > 1)
+        {
+            printf("error! found the error size\n");
+            exit(0);
         }
 
         ptr = NEXT_BLPR(ptr);

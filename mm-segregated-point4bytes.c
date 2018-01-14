@@ -1,7 +1,7 @@
 /*
- * mm.c
+ * mm-segregated-point4bytes.c
  * Allocator implement by segregated free list.
- * each allocated block struct like this
+ * Each allocated block struct like this
  *  31      ...           3| 2  1  0
  *  --------------------------------
  * | 00 ... size (29 bits) | 0 0 a/f| header 
@@ -13,7 +13,7 @@
  * whether the block is allocated or free.
  *
  *
- * each free block struct like this
+ * Each free block struct like this.
  *  31      ...           3| 2  1  0
  *  --------------------------------
  * | 00 ... size (29 bits) | 0 0 a/f| header 
@@ -21,17 +21,13 @@
  * |      pred (predecessor)        | pred_addr = heap_start_addr + pred
  * | 00 ... size (29 bits) | 0 0 a/f| footer
  *  --------------------------------
- * All free blocks organized by doubly linked list.
- * This reduces the first-fit allocation time.  
- *
- * Maintain the list in last-in first-out (LIFO),
- * inserting newly freed blocks at the beginning of the list. 
+ * Free blocks organized by doubly linked list.
  * 
- * The first 4 bytes of the heap are the 
- * prologue block of the linked list.
- * This block store the successor value.
- * The reason for this desgin is to optimize
- * the addition and remove of block. 
+ * The allocator maintains an array of free lists,
+ * with one free list per size class, ordered by increasing size.
+ * If given a allocate size n then the class size i is satisfied
+ * (2^(i+3)) <= n < (2^(i+4)). 
+ * If i >= SEG_MAX then i = SEG_MAX - 1.
  */
 #include <assert.h>
 #include <stdio.h>
@@ -112,10 +108,11 @@ static void place(void *ptr, size_t size);
 static void *coalesce(void *ptr);
 static unsigned int check_seg_list(int verbose);
 static unsigned int check_whole_heap(int verbose);
+
 /*
  * mm_init - Called when a new trace starts.
  * heap_start_addr              heap_listp
- * |                                 |
+ * |                                  |
  * |   seg array  (SEG_MAX * 4)   | 4 | 4 | 4 | 4 |
  * | 
  * free_listp
@@ -151,7 +148,7 @@ int mm_init(void)
 }
 
 /*
- * malloc - Allocate a block by incrementing the brk pointer.
+ * malloc - Allocate a block by segregated fit.
  *      Always allocate a block whose size is a multiple of the alignment.
  */
 void *malloc(size_t size)
@@ -170,16 +167,7 @@ void *malloc(size_t size)
     
     if (ptr == NULL) 
     {
-        // call mem_sbrk
-        // if ((ptr = mem_sbrk(newsize)) == (void *)-1) 
-        //     return NULL;
-        // PUT(ptr + newsize - WSIZE, 1);
-        // PUT(HDPR(ptr), PACK(newsize, 1));
-        // PUT(FTPR(ptr), PACK(newsize, 1));
-
-        // dbg_printf("malloc: %x, %p\n", (unsigned int)newsize, ptr);
-        // return ptr;
-
+        // Expend the size of at least CHUNKSIZE bytes 
         sbrk_size = ALIGN(MAX(newsize, CHUNKSIZE));
         if ((ptr = mem_sbrk(sbrk_size)) == (void *)-1) 
             return NULL;
@@ -215,8 +203,6 @@ void free(void *ptr)
     size = GET_SIZE(HDPR(ptr));   
     PUT(HDPR(ptr), PACK(size, 0));
     PUT(FTPR(ptr), PACK(size, 0));
-
-    // freelist_add(ptr);
 
     next_find_ptr = coalesce(ptr);
 }
@@ -348,6 +334,7 @@ void mm_checkheap(int verbose)
 
 }
 
+/* Given a size return the size class. */
 static inline unsigned int get_seg_index(size_t size)
 {
     unsigned int index = 0;
@@ -368,7 +355,7 @@ static inline void *pred_free_blk(void *ptr)
     return heap_start_addr + val;
 }
 
-/* remove request block from free list */
+/* Remove the request block from the free list. */
 static inline void freelist_remove(void *ptr)
 {
     // unsigned int index = get_seg_index(GET_SIZE(HDPR(ptr)));
@@ -382,6 +369,7 @@ static inline void freelist_remove(void *ptr)
     SET_PRED_VAL(succ, pred_val);  
 }
 
+/* Add the request block to the free list. */
 static inline void freelist_add(void *ptr)
 {   
     unsigned int index = get_seg_index(GET_SIZE(HDPR(ptr)));
@@ -399,6 +387,14 @@ static inline void freelist_add(void *ptr)
     SET_SUCC_VAL(start, cur_val);
 }
 
+/* 
+ * Segregated fits.
+ * We determine the size of class of the request and do 
+ * a first-fit search of the appropriate free list for
+ * a block that fits. If we cannot find a block that fits,
+ * then we search the free list for the next larger size class.  
+ * If none of the free lists yields a block that fits, then returns null.
+ */
 static void *find_first_fit(size_t size)
 {
     unsigned int index = 0;
@@ -510,7 +506,7 @@ static void place(void *ptr, size_t size)
 }
 
 /*
- * coalesce - merge adjacent free blocks
+ * coalesce - merge adjacent free blocks.
  *      Return a free block point after coalesce finish. 
  *      The next find fit need return the point. 
  */
@@ -595,7 +591,11 @@ static unsigned int check_seg_list(int verbose)
 
     return count;
 }
-
+/*
+ * Check the entire heap of data. Contains the size of block, 
+ * freed or allocted, number of freed block, address of block,
+ * if the block's head and feet are equal.
+ */
 static unsigned int check_whole_heap(int verbose) 
 {
     if (verbose < 0)
