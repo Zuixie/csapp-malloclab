@@ -15,12 +15,16 @@
  *
  * each free block struct like this
  *  31      ...           3| 2  1  0
- *  --------------------------------
- * | 00 ... size (29 bits) | 0 0 a/f| header 
- * |      succ (successor)          | succ_addr = heap_start_addr + succ
- * |      pred (predecessor)        | pred_addr = heap_start_addr + pred
- * | 00 ... size (29 bits) | 0 0 a/f| footer
- *  --------------------------------
+ *  ----------------------------------
+ * | 00 ... size (29 bits) | 0 b/r a/f| header 
+ * |      left child                  | 
+ * |      right child                 | 
+ * |      parents node                |
+ * |      padding                     |
+ * | 00 ... size (29 bits) | 0 b/r a/f| footer
+ *  ----------------------------------
+ * The both of left child and right child used 4 bytes.
+ * The 4bytes store the distance from address of heap start.
  * All free blocks organized by doubly linked list.
  * This reduces the first-fit allocation time.  
  *
@@ -66,9 +70,13 @@
 #define WSIZE 4
 #define DSIZE 8
 
+#define BLACK 1
+#define RED 0
+
 #define SEG_MAX 10
-#define MIN_BLOCK_SIZE 16
+#define MIN_BLOCK_SIZE 24
 #define CHUNKSIZE  (1<<8)
+
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 /* rounds up to the nearest multiple of ALIGNMENT */
@@ -86,12 +94,22 @@
 #define NEXT_BLPR(p) (FTPR(p) + DSIZE)
 #define PRE_BLPR(p) (((char *)(p)) - GET_SIZE(HDPR(p) - WSIZE))
 
-#define GET_PRED_PTR(p) ((char *)(p) + WSIZE)
-#define GET_SUCC_PTR(p) ((char *)(p))
-#define GET_PRED_VAL(p) GET(GET_PRED_PTR(p))
-#define GET_SUCC_VAL(p) GET(GET_SUCC_PTR(p))
-#define SET_PRED_VAL(p, val) PUT(GET_PRED_PTR(p), val)
-#define SET_SUCC_VAL(p, val) PUT(GET_SUCC_PTR(p), val)
+#define GET_LEFT_PTR(p) ((char *)(p))
+#define GET_RIGHT_PTR(p) ((char *)(p) + WSIZE)
+#define GET_PARENT_PTR(p) ((char *)(p) + DSIZE)
+
+#define GET_LEFT_VAL(p) GET(GET_LEFT_PTR(p))
+#define GET_RIGHT_VAL(p) GET(GET_RIGHT_PTR(p))
+#define GET_PARENT_VAL(p) GET(GET_PARENT_PTR(p))
+#define SET_LEFT_VAL(p, val) PUT(GET_LEFT_PTR(p), val)
+#define SET_RIGHT_VAL(p, val) PUT(GET_RIGHT_PTR(p), val)
+#define SET_PARENT_VAL(p, val) PUT(GET_PARENT_PTR(p), val)
+
+#define GET_POINTER(val) (heap_start_addr + (val)) // TEST
+
+#define SET_BLACK(p) PUT(p, (GET(p) | 0x02))
+#define SET_RED(p) PUT(p, (GET(p) & ~0x02))
+#define GET_COLOR(p) (GET(p) & 0x02)
 
 /* Global variables */
 static char *heap_listp;
@@ -101,17 +119,17 @@ static char *free_listp;
 
 /* Function prototypes for internal helper routines */
 static unsigned int get_seg_index(size_t size);
-static void *next_free_blk(void *ptr);
-static void *pred_free_blk(void *ptr);
 static void freelist_remove(void *ptr);
+static void remove_to_tree(void *ptr, void *root);
 static void freelist_add(void *ptr);
+static void insert_to_tree(void *root, void *newnode, size_t size);
 static void *find_first_fit(size_t size);
-static void *find_next_fit(size_t size);
-static void *find_best_fit(size_t size);
 static void place(void *ptr, size_t size);
 static void *coalesce(void *ptr);
 static unsigned int check_seg_list(int verbose);
 static unsigned int check_whole_heap(int verbose);
+static unsigned int check_tree(void *root, unsigned int index);
+
 /*
  * mm_init - Called when a new trace starts.
  * heap_start_addr              heap_listp
@@ -122,8 +140,8 @@ static unsigned int check_whole_heap(int verbose);
  */
 int mm_init(void)
 {
-    // allocate init block -> | arrary size: 8 * SEG_MAX | 16bytes |  
-    if ((heap_listp = mem_sbrk(4 * WSIZE + SEG_MAX * DSIZE))
+    // allocate init block -> | arrary size: 4 * SEG_MAX | 16bytes |  
+    if ((heap_listp = mem_sbrk(4 * WSIZE + SEG_MAX * WSIZE))
         == (void *)-1) 
         return -1;
     
@@ -132,17 +150,16 @@ int mm_init(void)
 
     for (unsigned int i = 0; i < SEG_MAX; i++) 
     {
-        PUT(heap_listp + i * DSIZE, i * DSIZE);
-        PUT(heap_listp + WSIZE + i * DSIZE, i * DSIZE);
+        PUT(heap_listp + i * WSIZE, 0);
     }
 
-    heap_listp += (SEG_MAX * DSIZE);
+    heap_listp += (SEG_MAX * WSIZE);
     PUT(heap_listp, 0);
     PUT(heap_listp + WSIZE, PACK(8, 1));
     PUT(heap_listp + 2 * WSIZE, PACK(8, 1));
     PUT(heap_listp + 3 * WSIZE, PACK(0, 1));
     heap_listp = heap_listp + DSIZE;
-    next_find_ptr = heap_listp;
+    // next_find_ptr = heap_listp;
 
     dbg_printf("init heap_listp:%p\n", heap_listp);
     dbg_printf("init heap_start_addr:%p\n", heap_start_addr);
@@ -163,35 +180,20 @@ void *malloc(size_t size)
     if (size <= 0) 
         return NULL;
     newsize = ALIGN(size + DSIZE);
+    newsize = MAX(newsize, MIN_BLOCK_SIZE);
 
     ptr = find_first_fit(newsize);
-    // ptr = find_best_fit(newsize);   
-    // ptr = find_next_fit(newsize);
     
     if (ptr == NULL) 
     {
-        // call mem_sbrk
-        // if ((ptr = mem_sbrk(newsize)) == (void *)-1) 
-        //     return NULL;
-        // PUT(ptr + newsize - WSIZE, 1);
-        // PUT(HDPR(ptr), PACK(newsize, 1));
-        // PUT(FTPR(ptr), PACK(newsize, 1));
-
-        // dbg_printf("malloc: %x, %p\n", (unsigned int)newsize, ptr);
-        // return ptr;
-
         sbrk_size = ALIGN(MAX(newsize, CHUNKSIZE));
         if ((ptr = mem_sbrk(sbrk_size)) == (void *)-1) 
             return NULL;
         PUT(ptr + sbrk_size - WSIZE, 1);
         PUT(HDPR(ptr), PACK(sbrk_size, 0));
         PUT(FTPR(ptr), PACK(sbrk_size, 0));
+        dbg_printf("sbrk: %x \n", (unsigned int)sbrk_size);
         freelist_add(ptr);
-
-        place(ptr, newsize);
-        dbg_printf("malloc: %x, %p\n", (unsigned int)newsize, ptr);
-
-        return ptr;
     }
 
     place(ptr, newsize);
@@ -246,6 +248,7 @@ void *realloc(void *oldptr, size_t size)
 
     oldsize = GET_SIZE(HDPR(oldptr));
     newsize = ALIGN(size + DSIZE);
+    newsize = MAX(newsize, MIN_BLOCK_SIZE);
 
     // oldsize == newsize, return oldptr
     if (oldsize == newsize) 
@@ -255,7 +258,7 @@ void *realloc(void *oldptr, size_t size)
     // newsize < oldsize, do not need to alloc new block 
     else if (newsize < oldsize)
     {
-        if (oldsize - newsize < 16) 
+        if (oldsize - newsize < MIN_BLOCK_SIZE) 
             return oldptr;
         // oldsize - newsize > 16 -> need to split and coalesce
         PUT(HDPR(oldptr), PACK(newsize, 1));
@@ -356,47 +359,186 @@ static inline unsigned int get_seg_index(size_t size)
     return index > SEG_MAX ? SEG_MAX - 1 : index - 1;
 }
 
-static inline void *next_free_blk(void *ptr) 
-{
-    unsigned int val = GET_SUCC_VAL(ptr);
-    return heap_start_addr + val;
-}
-
-static inline void *pred_free_blk(void *ptr)
-{
-    unsigned int val = GET_PRED_VAL(ptr);
-    return heap_start_addr + val;
-}
-
 /* remove request block from free list */
 static inline void freelist_remove(void *ptr)
 {
-    // unsigned int index = get_seg_index(GET_SIZE(HDPR(ptr)));
-    unsigned int pred_val = GET_PRED_VAL(ptr);
-    unsigned int succ_val = GET_SUCC_VAL(ptr);
-
-    char *pred = heap_start_addr + pred_val;
-    char *succ = heap_start_addr + succ_val;
+    unsigned int index = get_seg_index(GET_SIZE(HDPR(ptr)));
+    char *root = free_listp + WSIZE * index;
     
-    SET_SUCC_VAL(pred, succ_val);
-    SET_PRED_VAL(succ, pred_val);  
+    dbg_printf("remove: root: %p, ptr:%p\n", root, ptr);
+
+    remove_to_tree(ptr, root);
+}
+
+static void remove_to_tree(void *ptr, void *root)
+{
+    unsigned int left_val = GET_LEFT_VAL(ptr);
+    unsigned int right_val = GET_RIGHT_VAL(ptr);
+    unsigned int parent_val = GET_PARENT_VAL(ptr);
+    char *parent = GET_POINTER(parent_val);
+
+    if (!left_val && !right_val) 
+    {
+        if (parent_val) 
+        {
+            if (GET_POINTER(GET_LEFT_VAL(parent)) == ptr) 
+            {
+                SET_LEFT_VAL(parent, 0);
+            }
+            else 
+            {
+                SET_RIGHT_VAL(parent, 0);
+            }
+        }
+        else // root 
+        {
+            PUT(root, 0);
+        }
+    }
+    // right is null
+    else if (left_val && !right_val)
+    {
+        if (parent_val) 
+        {            
+            if (GET_POINTER(GET_LEFT_VAL(parent)) == ptr) 
+            {
+                SET_LEFT_VAL(parent, left_val);
+            }
+            else 
+            {
+                SET_RIGHT_VAL(parent, left_val);
+            }
+            SET_PARENT_VAL(GET_POINTER(left_val), parent_val);
+        } 
+        else 
+        {
+            PUT(root, left_val);
+            SET_PARENT_VAL(GET_POINTER(left_val), 0);
+        }
+    }
+    // left is null
+    else if (!left_val && right_val) 
+    {
+        if (parent_val) 
+        {            
+            if (GET_POINTER(GET_LEFT_VAL(parent)) == ptr) 
+            {
+                SET_LEFT_VAL(parent, right_val);
+            }
+            else 
+            {
+                SET_RIGHT_VAL(parent, right_val);
+            }
+            SET_PARENT_VAL(GET_POINTER(right_val), parent_val);
+        } 
+        else 
+        {
+            PUT(root, right_val);
+            SET_PARENT_VAL(GET_POINTER(right_val), 0);
+        }
+    }
+    // both left and right are not null
+    else 
+    {
+        // replace the node with right node
+        if (parent_val) 
+        {            
+            if (GET_POINTER(GET_LEFT_VAL(parent)) == ptr) 
+            {
+                SET_LEFT_VAL(parent, right_val);
+            }
+            else 
+            {
+                SET_RIGHT_VAL(parent, right_val);
+            }
+            SET_PARENT_VAL(GET_POINTER(right_val), parent_val);
+        } 
+        else 
+        {
+            PUT(root, right_val);
+            SET_PARENT_VAL(GET_POINTER(right_val), 0);
+        }
+
+        // find the the leftmost node && set left node
+        parent = GET_POINTER(right_val);
+         
+        while (GET_LEFT_VAL(parent))
+        {
+            parent = GET_POINTER(GET_LEFT_VAL(parent));
+        }
+        // set left node
+        SET_LEFT_VAL(parent, left_val);
+        SET_PARENT_VAL(GET_POINTER(left_val), parent - heap_start_addr);
+    }
+
 }
 
 static inline void freelist_add(void *ptr)
 {   
-    unsigned int index = get_seg_index(GET_SIZE(HDPR(ptr)));
-    char *start = free_listp + DSIZE * index;
-    unsigned int succ_val = GET_SUCC_VAL(start);
-    unsigned int cur_val = ((char *)ptr) - heap_start_addr;
+    size_t size = GET_SIZE(HDPR(ptr));
+    unsigned int index = get_seg_index(size);
+    char *start = free_listp + WSIZE * index;
+    char *root = heap_start_addr + GET(start);
 
-    // set block self
-    SET_PRED_VAL(ptr, index * DSIZE);
-    SET_SUCC_VAL(ptr, succ_val);
-    
-    // set succ block pred point
-    SET_PRED_VAL(heap_start_addr + succ_val, cur_val);
-    // set pred block succ point
-    SET_SUCC_VAL(start, cur_val);
+    // set new node self
+    SET_PARENT_VAL(ptr, 0);
+    SET_LEFT_VAL(ptr, 0);
+    SET_RIGHT_VAL(ptr, 0);
+
+    dbg_printf("insert r:%p, p:%p, s:%x\n", root, ptr, 
+               (unsigned int)size);
+
+    // if root is empty
+    if (root == heap_start_addr)
+    {
+        PUT(start, (char *)ptr - heap_start_addr);
+        return;
+    }
+
+    insert_to_tree(root, ptr, size);
+    // dbg_printf("insert success %d\n", check_seg_list(5));
+}
+
+/* Insert a given newnode to the tree */
+static void insert_to_tree(void *root, void *newnode, size_t size) 
+{
+    // root
+    if (root == heap_start_addr) 
+    {
+        PUT(root, (char *)newnode - heap_start_addr);
+        return;
+    }
+
+    unsigned int rval = GET_RIGHT_VAL(root);
+    unsigned int lval = GET_LEFT_VAL(root);
+
+    // insert to right
+    if (size > GET_SIZE(HDPR(root))) 
+    {
+        if (rval) 
+        {
+            // right is not null
+            insert_to_tree(heap_start_addr + rval, newnode, size);
+        } 
+        else 
+        {
+            SET_RIGHT_VAL(root, (char *)newnode - heap_start_addr);
+            SET_PARENT_VAL(newnode, (char *)root - heap_start_addr);
+        }
+    }
+    // insert to left
+    else 
+    {
+        if (lval) 
+        {
+            insert_to_tree(heap_start_addr + lval, newnode, size);
+        }
+        else 
+        {           
+            SET_LEFT_VAL(root, (char *)newnode - heap_start_addr);
+            SET_PARENT_VAL(newnode, (char *)root - heap_start_addr);
+        }
+    }
 }
 
 static void *find_first_fit(size_t size)
@@ -410,72 +552,21 @@ static void *find_first_fit(size_t size)
     
     for (; index < SEG_MAX; index++) 
     {
-        free_list_start = index * DSIZE + free_listp;
-        ptr = heap_start_addr + GET_SUCC_VAL(free_list_start);
-        while (ptr != free_list_start)
+        free_list_start = index * WSIZE + free_listp;
+        ptr = GET_POINTER(GET(free_list_start));
+
+        while (ptr != heap_start_addr)
         {        
             if (size <= GET_SIZE(HDPR(ptr))) 
             {
                 return ptr;
             }
-            ptr = heap_start_addr + GET_SUCC_VAL(ptr);
+            // ptr = heap_start_addr + GET_SUCC_VAL(ptr);
+            ptr = GET_POINTER(GET_RIGHT_VAL(ptr));
         }
     }
 
     return NULL;
-}
-
-static void *find_next_fit(size_t size)
-{
-    char *ptr = next_find_ptr;
-    char *temp;
-
-    do 
-    {
-        temp = HDPR(ptr);
-        if (GET_ALLOC(temp) == 0 && size <= GET_SIZE(temp)) 
-        {
-            next_find_ptr = ptr;
-            return ptr;
-        }
-
-        ptr = NEXT_BLPR(ptr);
-
-        if (GET(HDPR(ptr)) == 0x01) 
-            ptr = heap_listp;
-
-    } while (ptr != next_find_ptr);
-
-    return NULL;
-}
-
-static void *find_best_fit(size_t size)
-{
-    char *ptr = heap_start_addr + GET_SUCC_VAL(free_listp);
-    char *best_ptr = NULL;
-    size_t size_gap = 0;
-    char *temp;
-
-    while (ptr != heap_start_addr)
-    {
-        temp = HDPR(ptr);
-        // find free && have enough space
-        if (size <= GET_SIZE(temp)) 
-        {
-            // first or the size of gap smaller than the last one
-            if (GET_SIZE(temp) - size < size_gap || best_ptr == NULL) 
-            {
-                size_gap = GET_SIZE(temp) - size;
-                best_ptr = ptr;
-                if (size_gap == 0)
-                    return best_ptr;
-            }
-        }
-
-        ptr = heap_start_addr + GET_SUCC_VAL(ptr);
-    }
-
-    return best_ptr;
 }
 
 /*
@@ -485,6 +576,7 @@ static void *find_best_fit(size_t size)
  */
 static void place(void *ptr, size_t size)
 {
+    dbg_printf("start place ... ... %p, %x\n", ptr, (int)size);
     size_t blocksize = GET_SIZE(HDPR(ptr));
 
     if ((blocksize - size) < MIN_BLOCK_SIZE)
@@ -575,18 +667,16 @@ static unsigned int check_seg_list(int verbose)
     for (index = 0; index < SEG_MAX; index++) 
     {
         count_temp = 0;
-        free_list_start = index * DSIZE + free_listp;
-        ptr = heap_start_addr + GET_SUCC_VAL(free_list_start);
+        free_list_start = index * WSIZE + free_listp;
+        ptr = GET_POINTER(GET(free_list_start));
         if (verbose > 2) 
         {
-            dbg_printf("%p:%p-", free_list_start, ptr);
+            dbg_printf("start: %p; root: %p - ", free_list_start, ptr);
         }
-        while (ptr != free_list_start)
-        {        
-            count++;
-            count_temp++;
-            ptr = heap_start_addr + GET_SUCC_VAL(ptr);
-        }
+
+        count_temp = check_tree(ptr, index);
+        count += count_temp;
+
         if (verbose > 2)
         {
             dbg_printf("%u:%u\n", index, count_temp);
@@ -596,6 +686,7 @@ static unsigned int check_seg_list(int verbose)
     return count;
 }
 
+// TODO add the size of entire heap 
 static unsigned int check_whole_heap(int verbose) 
 {
     if (verbose < 0)
@@ -619,9 +710,11 @@ static unsigned int check_whole_heap(int verbose)
         }
         else
         {
-            dbg_printf("%p | %08x | %u | %p | %p | %p \n", temp, 
-                   size_temp, GET_ALLOC(temp), ptr,
-                   pred_free_blk(ptr), next_free_blk(ptr));
+            dbg_printf("%p | %08x | %u | %p | %p | %p | %p\n", temp, 
+                       size_temp, GET_ALLOC(temp), ptr,
+                       GET_POINTER(GET_LEFT_VAL(ptr)),
+                       GET_POINTER(GET_RIGHT_VAL(ptr)),
+                       GET_POINTER(GET_PARENT_VAL(ptr)));
             freecount_heap++;
             if (last_free) 
             {
@@ -647,4 +740,48 @@ static unsigned int check_whole_heap(int verbose)
     dbg_printf("free listp: %p\n", free_listp);
 
     return freecount_heap;
+}
+
+/* check binary search tree , reutrn this number of total free block*/
+static unsigned int check_tree(void *root, unsigned int index) 
+{
+    unsigned int left_val;
+    unsigned int left_size;
+    unsigned int right_val;
+    unsigned int right_size;
+    unsigned int root_size;
+    unsigned int count_right;
+    unsigned int count_left;
+
+    if (root == heap_start_addr) 
+    {
+        return 0;
+    }
+    
+    left_val = GET_LEFT_VAL(root);
+    right_val = GET_RIGHT_VAL(root);
+    root_size = GET_SIZE(HDPR(root));
+    
+    // check size 
+    left_size = left_val ? GET_SIZE(HDPR(GET_POINTER(left_val))) : root_size - 1;
+    right_size = right_val ? GET_SIZE(HDPR(GET_POINTER(right_val))) : root_size + 1; 
+
+    if (!(left_size <= root_size && right_size > root_size)) 
+    {
+        printf("error! tree: %p\n", root);
+        printf("root:%x, left:%x, right:%x\n", root_size, left_size, right_size);
+        exit(1);
+    }
+    
+    // check index 
+    if (index != get_seg_index(root_size)) 
+    {   
+        printf("error! tree: %p, %d\n", root, index);
+        printf("size:%x, %d.  The size does not belong to this group.\n",
+                root_size, get_seg_index(root_size));
+    }
+
+    count_right = check_tree(GET_POINTER(right_val), index);
+    count_left = check_tree(GET_POINTER(left_val), index);
+    return count_right + count_left + 1;
 }
