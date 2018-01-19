@@ -3,24 +3,25 @@
  * Allocator implement by segregated free list.
  * Each allocated block struct like this
  *  31      ...           3| 2  1  0
- *  --------------------------------
- * | 00 ... size (29 bits) | 0 0 a/f| header 
- * |       content ...              |
- * |       content ...              |
- * | 00 ... size (29 bits) | 0 0 a/f| footer
- *  --------------------------------
+ *  ----------------------------------
+ * | 00 ... size (29 bits) | 0 a/f a/f| header, 
+ * |       content ...                |
+ * |       content ...                |
+ *  ----------------------------------
  * The header encodes the block size as well as 
  * whether the block is allocated or free.
- *
+ * The second bit at header show the previous block
+ * is or not free. free = 0, allocted = 1
+ * 
  *
  * Each free block struct like this.
  *  31      ...           3| 2  1  0
- *  --------------------------------
- * | 00 ... size (29 bits) | 0 0 a/f| header 
- * |      succ (successor)          | succ_addr = heap_start_addr + succ
- * |      pred (predecessor)        | pred_addr = heap_start_addr + pred
- * | 00 ... size (29 bits) | 0 0 a/f| footer
- *  --------------------------------
+ *  ----------------------------------
+ * | 00 ... size (29 bits) | 0 a/f a/f| header
+ * |      succ (successor)            | succ_addr = heap_start_addr + succ
+ * |      pred (predecessor)          | pred_addr = heap_start_addr + pred
+ * | 00 ... size (29 bits) | 0 a/f a/f| footer
+ *  ----------------------------------
  * Free blocks organized by doubly linked list.
  * 
  * The allocator maintains an array of free lists,
@@ -76,6 +77,9 @@
 
 #define GET_SIZE(p) (GET(p) & ~0x07)
 #define GET_ALLOC(p) (GET(p) & 0x01)
+#define GET_BIT_FREE(p) ((GET(p) & 0x02) >> 1)
+#define SET_BIT_ALLOC(p) (PUT(p, GET(p) | 0x02)) // set bit -> 1
+#define SET_BIT_FREE(p) (PUT(p, GET(p) & ~0x02)) // set bit -> 0
 
 #define HDPR(p) (((char *)(p)) - WSIZE)
 #define FTPR(p) (((char *)(p)) + GET_SIZE(HDPR(p)) - DSIZE)
@@ -137,7 +141,7 @@ int mm_init(void)
     PUT(heap_listp, 0);
     PUT(heap_listp + WSIZE, PACK(8, 1));
     PUT(heap_listp + 2 * WSIZE, PACK(8, 1));
-    PUT(heap_listp + 3 * WSIZE, PACK(0, 1));
+    PUT(heap_listp + 3 * WSIZE, PACK(0, 3));
     heap_listp = heap_listp + DSIZE;
     next_find_ptr = heap_listp;
 
@@ -155,11 +159,12 @@ void *malloc(size_t size)
 {
     size_t newsize;
     size_t sbrk_size;
+    unsigned int temp;
     char *ptr;
 
     if (size <= 0) 
         return NULL;
-    newsize = ALIGN(size + DSIZE);
+    newsize = MAX(MIN_BLOCK_SIZE, ALIGN(size + WSIZE));
 
     ptr = find_first_fit(newsize);
     // ptr = find_best_fit(newsize);   
@@ -171,10 +176,14 @@ void *malloc(size_t size)
         sbrk_size = ALIGN(MAX(newsize, CHUNKSIZE));
         if ((ptr = mem_sbrk(sbrk_size)) == (void *)-1) 
             return NULL;
-        PUT(ptr + sbrk_size - WSIZE, 1);
-        PUT(HDPR(ptr), PACK(sbrk_size, 0));
-        PUT(FTPR(ptr), PACK(sbrk_size, 0));
-        freelist_add(ptr);
+
+        PUT(ptr + sbrk_size - WSIZE, 1); // 0001 set epilogue
+        temp = GET(ptr - WSIZE) & 0x2; // get pre block is free by epilogue && set first bit to 0
+
+        PUT(HDPR(ptr), PACK(sbrk_size, temp));
+        PUT(FTPR(ptr), PACK(sbrk_size, temp));
+        // freelist_add(ptr);
+        ptr = coalesce(ptr);
 
         place(ptr, newsize);
         dbg_printf("malloc: %x, %p\n", (unsigned int)newsize, ptr);
@@ -193,17 +202,19 @@ void *malloc(size_t size)
  */
 void free(void *ptr)
 {
-    size_t size;
-    
+    unsigned int temp;
     if (!ptr)
         return; 
 
     dbg_printf("free: %p, %p \n", HDPR(ptr), ptr);
 
-    size = GET_SIZE(HDPR(ptr));   
-    PUT(HDPR(ptr), PACK(size, 0));
-    PUT(FTPR(ptr), PACK(size, 0));
+    temp = GET(HDPR(ptr)); 
+    PUT(HDPR(ptr), temp & ~0x01); // set alloc bit to 0
+    PUT(FTPR(ptr), temp & ~0x01);
 
+    // set next block 
+    SET_BIT_FREE(HDPR(NEXT_BLPR(ptr)));
+    
     next_find_ptr = coalesce(ptr);
 }
 
@@ -216,6 +227,7 @@ void *realloc(void *oldptr, size_t size)
     dbg_printf("realloc: %p, %x\n", oldptr, (unsigned int)size);
     size_t oldsize, newsize;
     void *newptr, *temp;
+    unsigned int lowbit_val;
 
     // If size == 0 then this is just free, and we return NULL.
     if(size == 0) 
@@ -231,7 +243,7 @@ void *realloc(void *oldptr, size_t size)
     }
 
     oldsize = GET_SIZE(HDPR(oldptr));
-    newsize = ALIGN(size + DSIZE);
+    newsize = MAX(ALIGN(size + WSIZE), MIN_BLOCK_SIZE);
 
     // oldsize == newsize, return oldptr
     if (oldsize == newsize) 
@@ -241,15 +253,18 @@ void *realloc(void *oldptr, size_t size)
     // newsize < oldsize, do not need to alloc new block 
     else if (newsize < oldsize)
     {
-        if (oldsize - newsize < 16) 
+        if (oldsize - newsize < MIN_BLOCK_SIZE) 
             return oldptr;
-        // oldsize - newsize > 16 -> need to split and coalesce
-        PUT(HDPR(oldptr), PACK(newsize, 1));
-        PUT(FTPR(oldptr), PACK(newsize, 1));
+        // oldsize - newsize > MIN_BLOCK_SIZE -> need to split and coalesce
+        lowbit_val = GET_BIT_FREE(HDPR(oldptr)) << 1 | 1;
+        PUT(HDPR(oldptr), PACK(newsize, lowbit_val));
         
         temp = NEXT_BLPR(oldptr);
-        PUT(HDPR(temp), PACK(oldsize - newsize, 0));
-        PUT(FTPR(temp), PACK(oldsize - newsize, 0));
+        PUT(HDPR(temp), PACK(oldsize - newsize, 2));
+        PUT(FTPR(temp), PACK(oldsize - newsize, 2));
+
+        // set next block 
+        SET_BIT_FREE(HDPR(NEXT_BLPR(temp)));
 
         // freelist_add(temp);
         next_find_ptr = coalesce(temp);
@@ -264,8 +279,9 @@ void *realloc(void *oldptr, size_t size)
         {
             // next block is free and space is enough
             place(temp, newsize - oldsize);
-            PUT(HDPR(oldptr), PACK(oldsize + GET_SIZE(HDPR(temp)), 1));
-            PUT(FTPR(oldptr), PACK(GET_SIZE(HDPR(oldptr)), 1));
+            lowbit_val = GET_BIT_FREE(HDPR(oldptr)) << 1 | 1;
+            PUT(HDPR(oldptr), PACK(oldsize + GET_SIZE(HDPR(temp)), lowbit_val));
+            // PUT(FTPR(oldptr), PACK(GET_SIZE(HDPR(oldptr)), lowbit_val));
             next_find_ptr = oldptr;
             return oldptr;
         }
@@ -487,20 +503,22 @@ static void place(void *ptr, size_t size)
     {
         freelist_remove(ptr);
 
-        PUT(HDPR(ptr), PACK(blocksize, 1));
-        PUT(FTPR(ptr), PACK(blocksize, 1));
+        PUT(HDPR(ptr), PACK(blocksize, 3));
+        // PUT(FTPR(ptr), PACK(blocksize, 1));
+        // update the second bit of next block to 0 
+        SET_BIT_ALLOC(HDPR(NEXT_BLPR(ptr)));
     }
     else 
     {
         // split
         freelist_remove(ptr);
 
-        PUT(HDPR(ptr), PACK(size, 1));
-        PUT(FTPR(ptr), PACK(size, 1));
+        PUT(HDPR(ptr), PACK(size, 3));
+        PUT(FTPR(ptr), PACK(size, 3));
 
         ptr = NEXT_BLPR(ptr);
-        PUT(HDPR(ptr), PACK(blocksize - size, 0));
-        PUT(FTPR(ptr), PACK(blocksize - size, 0));
+        PUT(HDPR(ptr), PACK(blocksize - size, 2));
+        PUT(FTPR(ptr), PACK(blocksize - size, 2));
         freelist_add(ptr);
     }
 }
@@ -512,47 +530,56 @@ static void place(void *ptr, size_t size)
  */
 static void *coalesce(void *ptr)
 {
-    void *pre = PRE_BLPR(ptr);  
+    void *pre;  
     void *next = NEXT_BLPR(ptr);
+    
+    unsigned int prefree = GET_BIT_FREE(HDPR(ptr)); // 0-free 1-alloc
+    unsigned int nextfree = GET_ALLOC(HDPR(next)); // 0-free 1-alloc
+
     size_t size;
 
     // case 1 pre:alloc, next:alloc
-    if (GET_ALLOC(HDPR(pre)) && GET_ALLOC(HDPR(next))) 
+    if (prefree && nextfree) 
     {
         freelist_add(ptr);
         return ptr;
     }
     // case 2 pre:alloc, next:free
-    else if (GET_ALLOC(HDPR(pre)) && (!GET_ALLOC(HDPR(next)))) 
+    else if (prefree && !nextfree) 
     {
         freelist_remove(next);
 
         size = GET_SIZE(HDPR(ptr)) + GET_SIZE(HDPR(next));
-        PUT(HDPR(ptr), PACK(size, 0));
-        PUT(FTPR(ptr), PACK(size, 0));
+        PUT(HDPR(ptr), PACK(size, 2));
+        PUT(FTPR(ptr), PACK(size, 2));
 
         freelist_add(ptr);
         return ptr;
     }
     // case 3 pre:free, next:alloc
-    else if ((!GET_ALLOC(HDPR(pre))) && GET_ALLOC(HDPR(next))) 
+    else if (!prefree && nextfree) 
     {
+        pre = PRE_BLPR(ptr);
+
         freelist_remove(pre);
+
         size = GET_SIZE(HDPR(ptr)) + GET_SIZE(HDPR(pre));
-        PUT(HDPR(pre), PACK(size, 0));
-        PUT(FTPR(pre), PACK(size, 0));
+        PUT(HDPR(pre), PACK(size, 2));
+        PUT(FTPR(pre), PACK(size, 2));
         freelist_add(pre);
         return pre;
     }
     // case 4 pre:free, next:free
     else
     {
+        pre = PRE_BLPR(ptr); 
+
         freelist_remove(pre);
         freelist_remove(next);
 
         size = GET_SIZE(HDPR(ptr)) + GET_SIZE(HDPR(pre)) + GET_SIZE(HDPR(next));
-        PUT(HDPR(pre), PACK(size, 0));
-        PUT(FTPR(pre), PACK(size, 0)); 
+        PUT(HDPR(pre), PACK(size, 2));
+        PUT(FTPR(pre), PACK(size, 2)); 
 
         freelist_add(pre);
         return pre;
@@ -591,6 +618,7 @@ static unsigned int check_seg_list(int verbose)
 
     return count;
 }
+
 /*
  * Check the entire heap of data. Contains the size of block, 
  * freed or allocted, number of freed block, address of block,
@@ -604,9 +632,9 @@ static unsigned int check_whole_heap(int verbose)
     char *temp;
     unsigned int freecount_heap = 0;
     char *ptr = heap_listp;
-    int last_free = 0;
+    unsigned int last_free = 0;
 
-    while (GET(HDPR(ptr)) != 0x01)
+    while (GET_SIZE(HDPR(ptr)))
     {
         temp = HDPR(ptr);
         size_temp = GET_SIZE(temp);
@@ -614,35 +642,42 @@ static unsigned int check_whole_heap(int verbose)
         if (GET_ALLOC(temp))
         {
             dbg_printf("%p | %08x | %u | %p \n", 
-                   temp, size_temp, GET_ALLOC(temp), ptr);
-            last_free = 0;
+                   temp, size_temp, GET(temp) & 0x3, ptr);
+            last_free = 1;
         }
         else
         {
             dbg_printf("%p | %08x | %u | %p | %p | %p \n", temp, 
-                   size_temp, GET_ALLOC(temp), ptr,
+                   size_temp, GET(temp) & 0x3, ptr,
                    pred_free_blk(ptr), next_free_blk(ptr));
             freecount_heap++;
-            if (last_free) 
+            if (!last_free) 
             {
                 printf("%x error not coalesc!!! %p\n", size_temp, ptr);
                 exit(1);
             }
-            last_free = 1;
-        }
+            last_free = 0;
 
-        if (GET(HDPR(ptr)) != GET(FTPR(ptr))) 
-        {
-            printf("error!! head != foot %p\n", ptr);
-            exit(1);
+            if (GET(HDPR(ptr)) != GET(FTPR(ptr))) 
+            {
+                printf("error!! head != foot %p\n", ptr);
+                exit(1);
+            }
         }
 
         ptr = NEXT_BLPR(ptr);
+
+        // check pre free bit
+        if (GET_BIT_FREE(HDPR(ptr)) != last_free) 
+        {
+            printf("error second bit %p, %u\n", ptr, GET(HDPR(ptr)) & 0x3);
+            // exit(1);
+        } 
     }
 
     // epilogue
     temp = HDPR(ptr);
-    dbg_printf("%p | %08x | %u | %p \n", temp, GET_SIZE(temp), GET_ALLOC(temp), ptr);
+    dbg_printf("%p | %08x | %u | %p \n", temp, GET_SIZE(temp), GET(temp) & 0x3, ptr);
 
     dbg_printf("free listp: %p\n", free_listp);
 
